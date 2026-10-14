@@ -39,7 +39,7 @@ MIGRATE_LOG="$LOGS_DIR/migrate-v2.log"
 # Defaults for variables that may not be set if we exit early
 V1_PATH=""
 V1_VERSION="unknown"
-ONECLI_OK=false
+GATEWAY_OK=false
 SERVICE_SWITCHED=false
 SELECTED_CHANNELS=()
 ABORTED_AT=""
@@ -87,13 +87,13 @@ write_handoff() {
   "aborted_at": "$ABORTED_AT",
   "source": "migrate-v2.sh",
   "channels_installed": [$(printf '"%s",' "${SELECTED_CHANNELS[@]}" 2>/dev/null | sed 's/,$//')],
-  "onecli_healthy": $ONECLI_OK,
+  "gateway_healthy": $GATEWAY_OK,
   "service_switched": $SERVICE_SWITCHED,
   "steps": $steps_json,
   "step_logs_dir": "logs/migrate-steps",
   "followups": [
     "Seed owner user and access policy",
-    "Review CLAUDE.local.md files for v1-specific patterns",
+    "Run /migrate-memory for staged CLAUDE.local.md files",
     "Verify container.json mount paths are valid"
   ]
 }
@@ -242,8 +242,12 @@ fi
 
 V1_DB="$V1_PATH/store/messages.db"
 
-# Quick schema check — make sure the tables we need exist
-TABLES=$(sqlite3 "$V1_DB" ".tables" 2>/dev/null || true)
+# Quick schema check — make sure the tables we need exist.
+# Uses the in-tree wrapper instead of the sqlite3 CLI: setup.sh (run via
+# phase 0a above) installs Node + better-sqlite3 but NOT the sqlite3 CLI,
+# and #2191 documented how a missing CLI here used to surface as a
+# misleading "registered_groups missing" abort.
+TABLES=$(pnpm exec tsx scripts/q.ts "$V1_DB" "SELECT name FROM sqlite_master WHERE type='table'" 2>/dev/null || true)
 
 if echo "$TABLES" | grep -q "registered_groups"; then
   step_ok "v1 database has registered_groups"
@@ -253,8 +257,8 @@ else
 fi
 
 # Show what we found
-GROUP_COUNT=$(sqlite3 "$V1_DB" "SELECT COUNT(*) FROM registered_groups" 2>/dev/null || echo 0)
-TASK_COUNT=$(sqlite3 "$V1_DB" "SELECT COUNT(*) FROM scheduled_tasks WHERE status='active'" 2>/dev/null || echo 0)
+GROUP_COUNT=$(pnpm exec tsx scripts/q.ts "$V1_DB" "SELECT COUNT(*) FROM registered_groups" 2>/dev/null || echo 0)
+TASK_COUNT=$(pnpm exec tsx scripts/q.ts "$V1_DB" "SELECT COUNT(*) FROM scheduled_tasks WHERE status='active'" 2>/dev/null || echo 0)
 ENV_KEYS=0
 if [ -f "$V1_PATH/.env" ]; then
   ENV_KEYS=$(grep -c '=' "$V1_PATH/.env" 2>/dev/null || echo 0)
@@ -408,20 +412,12 @@ else
     fi
   done
 
-  # 2d. WhatsApp LID resolution. After whatsapp is installed (so Baileys
-  # is on disk) and auth files have been copied (so we can connect with
-  # the migrated identity), boot Baileys briefly to learn LID↔phone
-  # mappings during initial sync, then write paired LID-keyed
-  # messaging_groups. Best-effort: any failure degrades to runtime
-  # approval flow, which the WA adapter's isMention=true on DMs handles.
-  for ch in "${SELECTED_CHANNELS[@]}"; do
-    if [ "$ch" = "whatsapp" ]; then
-      run_step "2d-whatsapp-lids" \
-        "Resolve WhatsApp LIDs for migrated DMs" \
-        "setup/migrate-v2/whatsapp-resolve-lids.ts"
-      break
-    fi
-  done
+  # 2d. (Removed) WhatsApp LID resolution was previously needed because the
+  # v6 adapter couldn't reliably translate LID→phone JIDs, so the migration
+  # pre-created dual messaging_groups rows. With Baileys v7, the adapter
+  # resolves LIDs via extractAddressingContext + signalRepository.lidMapping
+  # on every inbound message, so dual rows are unnecessary and were causing
+  # split sessions.
 fi
 
 echo
@@ -433,7 +429,7 @@ echo
 echo "$(bold 'Phase 3: Infrastructure')"
 echo
 
-# 3a. Docker — install if missing (OneCLI needs it)
+# 3a. Docker — install if missing
 if command -v docker >/dev/null 2>&1; then
   DOCKER_V=$(docker --version 2>/dev/null | head -1)
   step_ok "Docker available $(dim "($DOCKER_V)")"
@@ -453,44 +449,34 @@ else
   fi
 fi
 
-# 3b. OneCLI — detect or install via setup step (requires Docker)
-ONECLI_OK=false
-ONECLI_URL_FROM_ENV=$(grep '^ONECLI_URL=' .env 2>/dev/null | head -1 | sed 's/^ONECLI_URL=//')
-ONECLI_URL_CHECK="${ONECLI_URL_FROM_ENV:-http://127.0.0.1:10254}"
-
-if curl -sf "${ONECLI_URL_CHECK}/health" >/dev/null 2>&1; then
-  step_ok "OneCLI running at $(dim "$ONECLI_URL_CHECK")"
-  ONECLI_OK=true
-  log "OneCLI: running at $ONECLI_URL_CHECK"
-elif command -v docker >/dev/null 2>&1; then
-  step_info "Setting up OneCLI…"
-  ONECLI_LOG="$STEPS_DIR/3b-onecli.log"
-  ONECLI_ERR="$STEPS_DIR/3b-onecli.err"
-  if pnpm exec tsx setup/index.ts --step onecli > "$ONECLI_LOG" 2>"$ONECLI_ERR"; then
-    step_ok "OneCLI ready"
-    ONECLI_OK=true
-    record_step "3b-onecli" "success"
-    log "OneCLI: installed/configured"
+# 3b. Gateway — preserve a detected install or install the catalog default
+GATEWAY_OK=false
+if command -v docker >/dev/null 2>&1; then
+  step_info "Setting up credential gateway…"
+  GATEWAY_LOG="$STEPS_DIR/3b-gateway.log"
+  GATEWAY_ERR="$STEPS_DIR/3b-gateway.err"
+  if pnpm exec tsx setup/index.ts --step gateway > "$GATEWAY_LOG" 2>"$GATEWAY_ERR"; then
+    step_ok "Credential gateway ready"
+    GATEWAY_OK=true
+    record_step "3b-gateway" "success"
+    log "Credential gateway: installed/configured"
   else
-    step_fail "OneCLI setup failed $(dim "(see $ONECLI_LOG)")"
-    record_step "3b-onecli" "failed"
-    log "OneCLI: FAILED"
+    step_fail "Gateway setup failed $(dim "(see $GATEWAY_LOG)")"
+    record_step "3b-gateway" "failed"
+    log "Credential gateway: FAILED"
   fi
 else
-  step_fail "OneCLI needs Docker $(dim "(install Docker first)")"
-  record_step "3b-onecli" "failed"
-  log "OneCLI: skipped (no Docker)"
+  step_fail "Credential gateway needs Docker $(dim "(install Docker first)")"
+  record_step "3b-gateway" "failed"
+  log "Credential gateway: skipped (no Docker)"
 fi
 
-# 3c. Anthropic credential — run the auth setup step if no credential found
-if grep -qE '^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=' .env 2>/dev/null; then
-  step_ok "Anthropic credential found in .env"
-  log "Anthropic credential: found in .env"
-elif [ "$ONECLI_OK" = "true" ]; then
+# 3c. Anthropic credential — the selected gateway owns migration and auth
+if [ "$GATEWAY_OK" = "true" ]; then
   step_info "Registering Anthropic credential…"
   AUTH_LOG="$STEPS_DIR/3c-auth.log"
   AUTH_ERR="$STEPS_DIR/3c-auth.err"
-  if pnpm exec tsx setup/index.ts --step auth > "$AUTH_LOG" 2>"$AUTH_ERR"; then
+  if pnpm exec tsx setup/index.ts --step gateway-auth claude > "$AUTH_LOG" 2>"$AUTH_ERR"; then
     step_ok "Anthropic credential registered"
     record_step "3c-auth" "success"
     log "Anthropic credential: registered via auth step"
@@ -500,8 +486,8 @@ elif [ "$ONECLI_OK" = "true" ]; then
     log "Anthropic credential: FAILED"
   fi
 else
-  step_info "No Anthropic credential $(dim "(OneCLI not available — add manually to .env)")"
-  log "Anthropic credential: skipped (no OneCLI)"
+  step_info "No Anthropic credential $(dim "(gateway not available — add it after migration)")"
+  log "Anthropic credential: skipped (no gateway)"
 fi
 
 # 3d. Copy container skills from v1 that v2 doesn't have
@@ -531,14 +517,25 @@ else
   step_skip "No v1 container skills"
 fi
 
-# 3e. Build agent container image
+# 3e. Acquire the agent container image
 if command -v docker >/dev/null 2>&1; then
-  step_info "Building agent container image…"
+  # Honour an install that pulls rather than builds. The bare form deliberately
+  # exits 3 there rather than replacing pulled bytes with a local build, so
+  # calling it unconditionally would report "build failed" on a working install.
+  IMAGE_SOURCE_SETTING="$(grep '^NANOCLAW_HARDENED_IMAGE=' .env 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  if [ "$IMAGE_SOURCE_SETTING" = "true" ]; then
+    BUILD_ARGS="pull"
+    step_info "Fetching pinned agent container image…"
+  else
+    BUILD_ARGS=""
+    step_info "Building agent container image…"
+  fi
   BUILD_LOG="$STEPS_DIR/3e-container-build.log"
-  if bash container/build.sh > "$BUILD_LOG" 2>&1; then
-    step_ok "Container image built"
+  # shellcheck disable=SC2086 -- BUILD_ARGS is one optional literal word.
+  if bash container/build.sh $BUILD_ARGS > "$BUILD_LOG" 2>&1; then
+    step_ok "Container image ready"
     record_step "3e-build" "success"
-    log "Container build: success"
+    log "Container image: success (${BUILD_ARGS:-build})"
   else
     step_fail "Container build failed"
     record_step "3e-build" "failed"
@@ -701,7 +698,7 @@ echo
 echo "  $(bold 'What was done:')"
 echo "    $(green '✓')  .env keys merged"
 echo "    $(green '✓')  Database seeded (agent groups, messaging groups, wiring)"
-echo "    $(green '✓')  Group folders copied (CLAUDE.md → CLAUDE.local.md)"
+echo "    $(green '✓')  Group folders copied (CLAUDE.md staged for /migrate-memory)"
 echo "    $(green '✓')  Session data copied"
 echo "    $(green '✓')  Scheduled tasks ported"
 if [ ${#SELECTED_CHANNELS[@]} -gt 0 ]; then
@@ -721,11 +718,11 @@ fi
 fi
 echo
 echo "  $(bold 'What still needs a human:')"
-if [ "$ONECLI_OK" = "false" ]; then
-echo "    $(dim '·')  Set up OneCLI: pnpm exec tsx setup/index.ts --step onecli"
+if [ "$GATEWAY_OK" = "false" ]; then
+echo "    $(dim '·')  Set up the credential gateway: pnpm exec tsx setup/index.ts --step gateway"
 fi
-if ! grep -qE '^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=' .env 2>/dev/null; then
-echo "    $(dim '·')  Add Anthropic credential to .env or OneCLI vault"
+if [ "$GATEWAY_OK" = "false" ]; then
+echo "    $(dim '·')  Add the Anthropic credential through the selected gateway"
 fi
 echo "    $(dim '·')  Run $(bold '/migrate-from-v1') in Claude to finish:"
 echo "       $(dim '- Seed your owner account')"
